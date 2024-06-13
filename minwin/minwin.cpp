@@ -1,6 +1,7 @@
 ﻿#include <iostream>
 #include <fstream>
 #include <sstream>
+#include <mutex>
 
 #include <cstdio>
 #include <vector>
@@ -45,40 +46,67 @@ PROCESS_INSTRUMENTATION_CALLBACK_INFORMATION callback = { 0 };
 
 
 std::vector<uintptr_t> g_hooked = {};
+std::vector<uintptr_t> g_intercepted = {};
+std::mutex g_intercepted_mtx;
+bool g_isWatchEnabled = false;
+
+
+void dump_symbol(uintptr_t R10)
+{
+	uint8_t buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = { 0 };
+
+	const auto symbol_info = (PSYMBOL_INFO)buffer;
+	symbol_info->SizeOfStruct = sizeof(SYMBOL_INFO);
+	symbol_info->MaxNameLen = MAX_SYM_NAME;
+	uintptr_t displacement;
+
+	// MSDN: Retrieves symbol information for the specified address.
+	const auto result = SymFromAddr(GetCurrentProcess(), R10, &displacement, symbol_info);
+
+	// Deny access if function is hooked
+	if (result)
+	{
+		// Print what we know
+		std::stringstream ss;
+		ss << "\tFunction: " << symbol_info->Name << " Return address: " << std::hex << R10;
+		TraceLog::logLine(ss.str());
+	}
+}
+
+void dump_results()
+{
+	for (auto itr = g_intercepted.begin(); itr != g_intercepted.end(); ++itr) {
+		uintptr_t R10 = *itr;
+		std::stringstream ss;
+		ss << "\tReturn address: " << std::hex << R10;
+		TraceLog::logLine(ss.str());
+	}
+}
+
+void storeFunc(uintptr_t R10)
+{
+	const std::lock_guard<std::mutex> lock(g_intercepted_mtx);
+	g_intercepted.push_back(R10);
+}
 
 uintptr_t hook(uintptr_t R10, uintptr_t RAX/* ... */) {
+	if (!g_isWatchEnabled) return RAX;
+
 	static bool flag = false;
 	// This flag is there for prevent recursion
 	if (!flag) {
+		
 		flag = true;
-
-		uint8_t buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = { 0 };
-		const auto symbol_info = (PSYMBOL_INFO)buffer;
-		symbol_info->SizeOfStruct = sizeof(SYMBOL_INFO);
-		symbol_info->MaxNameLen = MAX_SYM_NAME;
-		uintptr_t displacement;
-
-		// MSDN: Retrieves symbol information for the specified address.
-		const auto result = SymFromAddr(GetCurrentProcess(), R10, &displacement, symbol_info);
-
-		// Deny access if function is hooked
-		if (result && 
-			std::find(g_hooked.begin(), g_hooked.end(), symbol_info->Address) != std::end(g_hooked)
-			)
-		{
-			// Print what we know
-			std::stringstream ss;
-			ss << "\tFunction: " << symbol_info->Name << " Return value: " << std::hex << RAX;
-			TraceLog::logLine(ss.str());
-			//printf("[+] function: %s\n\treturn value: 0x%llx\n\treturn address: 0x%llx\n", symbol_info->Name, RAX, R10);
-			//RAX = STATUS_ACCESS_DENIED;
-		}
+		storeFunc(R10);
 		flag = false;
+		
 		return RAX;
 	}
 
 	return RAX;
 }
+
+
 
 int run_demo()
 {
@@ -138,16 +166,19 @@ bool install_hook()
 	callback.Callback = medium;
 
 	// Add hook for NtQVM
-	g_hooked.push_back((uintptr_t)GetProcAddress(GetModuleHandleA("ntdll"), "ZwAllocateVirtualMemory"));
+	//g_hooked.push_back((uintptr_t)GetProcAddress(GetModuleHandleA("ntdll"), "ZwAllocateVirtualMemory"));
 
 	// Setup the hook
 	NTSTATUS res = NtSetInformationProcess(GetCurrentProcess(), (PROCESS_INFORMATION_CLASS)0x28, &callback, sizeof(callback));
 	isHooked = true;
-	return res == 0 ? true : false;
+	bool isOk = res == 0 ? true : false;
+	g_isWatchEnabled = isOk;
+	return isOk;
 }
 
 bool uninstall_hook()
 {
+	g_isWatchEnabled = false;
 	// Check if unaffected functions don't crash
 	NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)0, nullptr, 0, nullptr);
 
@@ -159,6 +190,7 @@ bool uninstall_hook()
 	return res == 0 ? true : false;
 }
 
+
 #define USE_DLL
 #ifdef USE_DLL
 BOOL WINAPI DllMain(HANDLE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
@@ -168,8 +200,11 @@ BOOL WINAPI DllMain(HANDLE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 	case DLL_PROCESS_ATTACH:
 		install_hook();
 		break;
+	case DLL_THREAD_DETACH:
+		break;
 	case DLL_PROCESS_DETACH:
 		uninstall_hook();
+		dump_results();
 		break;
 	}
 	return TRUE;
